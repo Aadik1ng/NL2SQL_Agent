@@ -7,122 +7,15 @@ Add a tool: write a function with type hints and a Google-style docstring, decor
 @tool(parse_docstring=True), and add it to the list in tools_for(). The docstring is what the model reads to decide
 when to call it.
 """
-import itertools
 import json
-import os
-import re
-import sqlite3
 import statistics
-import time
-import tomllib
 from collections import defaultdict
-from contextlib import closing
-from datetime import date
-from pathlib import Path
 
 from langchain_core.tools import StructuredTool, tool
 
-ROOT = Path(__file__).parent
-REGISTRY = Path(os.environ.get("DATABASES", ROOT / "databases.toml"))
-MAX_ROWS = 25  # rows shown to the model; {{rN.col}} references still carry every row
-KEEP_ROWS = 10_000  # rows kept per result for {{rN.column}} references
-TIMEOUT_S = 10
-RESULTS = {}  # ponytail: every result kept for the process lifetime; fine for a CLI, add eviction for a server
-_refs = itertools.count(1)
-REF = re.compile(r"\{\{(r\d+)(?:\.(\w+))?\}\}")  # {{r3.col}} = a column's values, {{r3}} = the whole result
-
-
-def _deny_attach(action, *_):
-    # read-only already blocks writes; this stops ATTACH of some other (writable) file
-    return sqlite3.SQLITE_DENY if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH) else sqlite3.SQLITE_OK
-
-
-def load_registry():
-    """The configured databases, context and as-of date, read fresh from databases.toml."""
-    return tomllib.loads(REGISTRY.read_text())
-
-
-def db_path(database):
-    databases = load_registry()["databases"]
-    if database not in databases:
-        raise ValueError(f"unknown database {database!r}; configured: {', '.join(databases)}")
-    return (REGISTRY.parent / databases[database]["path"]).resolve()
-
-
-def run_sql(database, sql, params=(), limit=MAX_ROWS):
-    """Execute one statement read-only on a configured database. Returns (columns, rows), up to limit+1 rows."""
-    with closing(sqlite3.connect(f"file:{db_path(database)}?mode=ro", uri=True)) as conn:
-        conn.set_authorizer(_deny_attach)
-        deadline = time.monotonic() + TIMEOUT_S
-        conn.set_progress_handler(lambda: time.monotonic() > deadline, 10_000)
-        try:
-            cur = conn.execute(sql, params)
-        except sqlite3.OperationalError as e:
-            if str(e) == "interrupted":
-                raise TimeoutError(f"query ran over {TIMEOUT_S}s; filter earlier or avoid cross joins") from e
-            raise
-        return [c[0] for c in cur.description or []], cur.fetchmany(limit + 1)
-
-
-def to_json(cols, rows, ref=None):
-    out = {"columns": cols, "rows": [[round(v, 2) if isinstance(v, float) else v for v in r] for r in rows[:MAX_ROWS]],
-           "row_count": min(len(rows), MAX_ROWS)}
-    if ref:
-        out["result_ref"] = ref
-    if len(rows) > MAX_ROWS:
-        total = f"{KEEP_ROWS}+" if len(rows) > KEEP_ROWS else len(rows)
-        out["note"] = (f"showing {MAX_ROWS} of {total} rows; aggregate in SQL, or use all rows in a later query: "
-                       f"{{{{{ref}.<column>}}}} for a list, {{{{{ref}}}}} as a table")
-    return json.dumps(out, default=str, ensure_ascii=False)
-
-
-def remember(cols, rows):
-    """Store a result under a new ref (r1, r2, ...) and return it formatted for the model."""
-    ref = f"r{next(_refs)}"
-    RESULTS[ref] = (cols, rows[:KEEP_ROWS])
-    return to_json(cols, rows, ref)
-
-
-def _quote(v):
-    if v is None:
-        return "NULL"
-    return str(v) if isinstance(v, (int, float)) else "'" + str(v).replace("'", "''") + "'"
-
-
-def _as_table(cols, rows):
-    """A stored result as an inline table with its own column names, usable in FROM/JOIN of any database."""
-    if not rows:
-        return "(SELECT " + ", ".join(f'NULL AS "{c}"' for c in cols) + " WHERE 0)"
-    names = ", ".join(f'column{i + 1} AS "{c}"' for i, c in enumerate(cols))
-    tuples = ", ".join("(" + ", ".join(_quote(v) for v in r) + ")" for r in rows)
-    return f"(SELECT {names} FROM (VALUES {tuples}))"
-
-
-def expand_refs(sql):
-    """{{r3.col}} -> the distinct quoted values of `col` in stored result r3, for IN (...).
-    {{r3}} -> the whole of r3 as a table, for joining or grouping by columns that live in another database.
-    Both use every stored row, not just the ones the model was shown."""
-    def values(m):
-        ref, col = m.groups()
-        if ref not in RESULTS:
-            raise ValueError(f"unknown result {ref}; available: {', '.join(RESULTS) or 'none'}")
-        cols, rows = RESULTS[ref]
-        if col is None:
-            return _as_table(cols, rows)
-        if col not in cols:
-            raise ValueError(f"{ref} has no column {col!r}; its columns are {cols}")
-        i = cols.index(col)
-        return ", ".join(dict.fromkeys(_quote(r[i]) for r in rows if r[i] is not None))
-    return REF.sub(values, sql)
-
-
-def as_of():
-    return load_registry().get("as_of") or date.today().isoformat()
-
-
-def table_names(database):
-    return [r[0] for r in run_sql(database, "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') "
-                                            "AND name NOT LIKE 'sqlite_%' ORDER BY name", limit=10_000)[1]]
+from database.executor import run_sql, table_names
+from database.references import KEEP_ROWS, MAX_ROWS, check_not_retyped, expand_refs, remember, to_json
+from database.registry import load_registry
 
 
 def database_overview():
@@ -134,13 +27,6 @@ def database_overview():
         tables = ", ".join(f"{t} ({notes[t]})" if t in notes else t for t in table_names(name))
         lines.append(f"- {name} (tool query_{name}): {cfg.get('description', '')}. Tables: {tables}")
     return "\n".join(lines)
-
-
-def check_not_retyped(sql):
-    """Reject queries that carry an earlier result as hand-typed literals: models drop or invent rows when copying."""
-    if len(re.findall(r"'[^']*'", sql)) > 25 and not REF.search(sql):
-        raise ValueError("This query retypes many values by hand. Use {{rN.column}} for a list of values or {{rN}} for "
-                         "a whole earlier result as a table; copied data gets rows dropped or invented.")
 
 
 def query_tool(name, description):

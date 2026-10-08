@@ -11,13 +11,10 @@ LangGraph runs the loop; Pydantic AI produces the typed plan. The prompt holds n
 databases and their tables, and the agent looks up columns with describe_tables when it needs them.
 """
 import json
-import os
 import sys
 import time
-import urllib.request
 import uuid
 from functools import cache
-from pathlib import Path
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -34,32 +31,10 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 
-from tools import REGISTRY, as_of, database_overview, load_registry, tools_for
+from config.settings import LANGFUSE_KEYS, LLM_API_KEY, LLM_BASE_URL, MODEL, TRACING, reachable
+from database.registry import REGISTRY, as_of, load_registry
+from tools import database_overview, tools_for
 
-env_file = Path(__file__).with_name(".env")
-if env_file.exists():
-    for line in env_file.read_text().splitlines():
-        key, sep, value = line.partition("=")
-        if sep and not key.strip().startswith("#"):
-            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
-
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
-LLM_API_KEY = os.environ.get("LLM_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
-MODEL = os.environ.get("MODEL", "anthropic/claude-haiku-4.5")
-
-
-def reachable(url):
-    try:
-        urllib.request.urlopen(url, timeout=2)
-        return True
-    except Exception:
-        return False
-
-
-LANGFUSE_KEYS = bool(os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"))
-# Tracing is on when keys are set and Langfuse answers; if it's down the agent just runs untraced
-TRACING = LANGFUSE_KEYS and reachable(os.environ.get("LANGFUSE_BASE_URL", "https://cloud.langfuse.com") +
-                                      "/api/public/health")
 MAX_TOOL_ROUNDS = 12  # after this the agent must answer with what it has
 console = Console()
 

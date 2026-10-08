@@ -13,7 +13,7 @@ amount_lakhs. A column ending in _lakhs is already in lakhs; never relabel lakhs
 as_of = "2026-10-08"
 
 [databases.erp]
-path = "data/erp.db"
+path = "../data/erp.db"
 description = "Sales and operations: customers, sales invoices, line items, payments, inventory, vendors, purchase orders"
 
 [databases.erp.tables]  # optional one-liners for tables whose purpose isn't obvious from the name
@@ -22,7 +22,7 @@ purchase_orders = "our purchases from vendors, with the vendor's bill and when w
 invoice_balance = "view: each invoice with amount paid, balance and days past due"
 
 [databases.crm]
-path = "data/crm.db"
+path = "../data/crm.db"
 description = "Sales relationships: accounts (linked to ERP customers via erp_customer_id), contacts, activities, opportunities, NPS"
 
 [databases.crm.tables]
