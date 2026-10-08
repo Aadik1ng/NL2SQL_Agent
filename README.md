@@ -118,16 +118,22 @@ A LangGraph `StateGraph` with three nodes:
 How the requirements map to the loop:
 
 - **Decomposition**: the `plan` node always runs first, so every question gets a visible plan.
-- **Adaptive multi-step querying**: ERP and CRM are separate SQLite files, so no single SQL
+- **Adaptive multi-step querying**: each database is a separate SQLite file, so no single SQL
   statement can join them. The agent has to run a query on one side, read the IDs, and
   build the next query from them. Each `agent` turn sees all prior results and decides the
   next query, so it changes course when a result is empty or surprising.
-- **Deterministic ID hand-off**: every tool result is stored under a reference (`r1`, `r2`, …).
-  A later query writes `WHERE customer_id IN ({{r3.erp_customer_id}})`, and the tool fills in
-  every value of that column, including rows beyond the 100 the model was shown. The model never
-  copies IDs by hand. That used to drop IDs on Haiku, and made anti-joins like "customers with no
-  CRM activity" (214 IDs) impossible under the row cap. The trace shows the reference, not
-  the expanded list.
+- **Deterministic hand-off between databases**: every tool result is stored under a reference
+  (`r1`, `r2`, …), and a later query on any database can use it with every stored row, not just
+  the 25 the model saw:
+  - `WHERE customer_id IN ({{r3.erp_customer_id}})` inserts one column's values, for filters
+    and anti-joins (`NOT IN`).
+  - `JOIN {{r3}} AS m ON m.erp_customer_id = i.customer_id` inserts the whole result as a
+    table, for grouping or joining by a column that lives in another database ("revenue per
+    CRM sales rep").
+
+  The model never copies data by hand. That used to drop or invent IDs, and the tools now reject
+  any query that carries more than 25 hand-typed values without a reference. The trace shows the
+  reference, not the expanded list.
 - **Error recovery**: `ToolNode(handle_tool_errors=True)` turns SQL errors (bad column,
   timeout, multiple statements) into messages. The prompt tells the agent to read the error,
   check the schema and retry with a fix.
@@ -135,9 +141,12 @@ How the requirements map to the loop:
   what it has and say what's missing.
 - **Follow-ups**: an `InMemorySaver` checkpointer keeps the conversation per thread, so
   "now only Pune customers" works in the REPL. `/new` resets.
-- **Schema awareness**: the system prompt carries the live DDL of both databases, comments
-  included. The comments are the data dictionary (status values, how to compute days late,
-  the ERP↔CRM link).
+- **Schema on demand**: the prompt holds no schema, only the databases from `databases.toml`
+  with their table names (about 470 tokens in all). Before querying a table, the agent calls
+  `describe_tables`, which returns its DDL, the column comments (status values, how to compute
+  days late, which columns link to another database) and 3 sample rows. The registry is re-read
+  before every question, so adding a database needs no code change, redeploy or restart (see
+  [Connecting a database](#connecting-a-database)).
 
 Observability: set `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` (plus `LANGFUSE_BASE_URL`
 if self-hosted) and every run is traced in Langfuse through its LangChain callback. To run
@@ -160,8 +169,8 @@ prints the trace URL after each answer. `eval.py` attaches an `eval_pass` score 
 question's session, so regressions show up next to the trace. Without the keys, tracing is off.
 
 Safety: LLM-written SQL runs on a read-only connection (`mode=ro`) with an authorizer that
-blocks `ATTACH`, a 10-second timeout, one statement per call, and results capped at 100 rows
-(the agent is told to aggregate in SQL).
+blocks `ATTACH`, a 10-second timeout and one statement per call. The model sees 25 rows per
+result and is told to aggregate in SQL.
 
 Why plain LangGraph with an explicit graph instead of `create_react_agent`: the reasoning
 loop is the deliverable, so it's written out where you can see it.
@@ -194,22 +203,23 @@ Pydantic AI eval judge ───────┘    aliases, retries, fallback, o
 
 | Tool | Purpose |
 |---|---|
-| `query_erp(sql)` | Raw read-only SQL on ERP |
-| `query_crm(sql)` | Raw read-only SQL on CRM |
+| `query_<name>(sql)` | Read-only SQL on one configured database: one tool per entry in `databases.toml`, so `query_erp` and `query_crm` here |
+| `describe_tables(database, tables)` | DDL, column comments and 3 sample rows for the tables the agent is about to query |
+| `analyze_trends(database, sql, recent_periods)` | Takes `(entity, period, value)` rows; returns slope, recent vs prior average and change per entity |
 | `find_customers_by_criteria(...)` | Customer metrics in one call: invoices in a window, lifetime spend, outstanding, overdue, first/last invoice, dormancy |
 | `find_invoices(...)` | Invoices with balance, days past due, reason code; optionally one row per line item with SKU |
-| `analyze_trends(database, sql, recent_periods)` | Takes `(entity, period, value)` rows; returns slope, recent vs prior average and change per entity |
 
-`analyze_trends` takes SQL rather than raw data, so the model doesn't have to copy hundreds of
-rows back into a tool call. `query_erp`, `query_crm` and `analyze_trends` accept
-`{{rN.column}}` references to earlier results. A new tool gets a reference for its own output by
+The last two are written for this dataset's ERP schema, so they're offered only when an `erp`
+database is configured. `analyze_trends` takes SQL rather than raw data, so the model doesn't
+copy hundreds of rows back into a tool call. The query tools and `analyze_trends` accept
+`{{rN.column}}` and `{{rN}}` references. A new tool gets a reference for its own output by
 returning `remember(cols, rows)` instead of `to_json(cols, rows)`.
 
 ### Adding a tool
 
 Tools are plain functions in `tools.py`. The type hints become the JSON schema and the
 docstring becomes the description the model reads. Example: add this to `tools.py`
-and append it to `TOOLS`. Nothing else changes.
+and add it to the list in `tools_for()`. Nothing else changes.
 
 ```python
 @tool(parse_docstring=True)
@@ -224,9 +234,9 @@ def calculate_roi_by_customer(customer_ids: list[str], months: int = 12, margin_
         cost_per_touch: Assumed INR cost of one CRM activity (call, email or meeting).
     """
     ids, window = ",".join("?" * len(customer_ids)), f"-{months} months"
-    _, revenue = run_sql("erp.db", f"SELECT customer_id, SUM(total_amount) FROM invoices WHERE customer_id IN ({ids}) "
+    _, revenue = run_sql("erp", f"SELECT customer_id, SUM(total_amount) FROM invoices WHERE customer_id IN ({ids}) "
                          "AND invoice_date >= date((SELECT as_of FROM meta), ?) GROUP BY 1", [*customer_ids, window])
-    _, touches = run_sql("crm.db", "SELECT a.erp_customer_id, COUNT(*) FROM activities t JOIN accounts a ON a.id = "
+    _, touches = run_sql("crm", "SELECT a.erp_customer_id, COUNT(*) FROM activities t JOIN accounts a ON a.id = "
                          f"t.account_id WHERE a.erp_customer_id IN ({ids}) AND t.occurred_at >= "
                          "date((SELECT as_of FROM meta), ?) GROUP BY 1", [*customer_ids, window])
     revenue, touches = dict(revenue), dict(touches)
@@ -236,10 +246,44 @@ def calculate_roi_by_customer(customer_ids: list[str], months: int = 12, margin_
         rows.append([cid, revenue.get(cid, 0), margin, touches.get(cid, 0), cost, margin / cost if cost else None])
     return remember(["customer_id", "revenue", "gross_margin", "touches", "sales_cost", "roi_multiple"], rows)
 
-TOOLS = [query_erp, query_crm, find_customers_by_criteria, find_invoices, analyze_trends, calculate_roi_by_customer]
+# in tools_for():
+    tools += [describe_tables, analyze_trends, calculate_roi_by_customer]
 ```
 
 Then ask: *"What's the ROI on sales effort for our top 5 customers?"*
+
+## Connecting a database
+
+Add an entry to `databases.toml`. That's all: no code change, redeploy or restart, because the
+agent re-reads the file before every question.
+
+```toml
+[databases.targets]
+path = "data/targets.db"                       # SQLite file, relative to databases.toml
+description = "Sales targets per rep and quarter"
+
+[databases.targets.tables]                     # optional: only for tables whose purpose isn't obvious
+sales_targets = "quarterly revenue target per rep, in lakhs"
+```
+
+The agent gets a `query_targets` tool, sees the new tables in its prompt, and reads their columns
+with `describe_tables` when it needs them. What makes a new database work well:
+
+- **Column comments in the DDL** (`target_lakhs REAL -- revenue target in INR lakhs`) are the
+  data dictionary: units, allowed values, and which column links to which other database
+  (`rep TEXT -- same as CRM accounts.owner_rep`).
+- **`context`** at the top of the file holds business conventions that apply everywhere
+  (domain, currency units). **`as_of`** pins "today" for a fixed dataset; leave it out to use
+  the real date.
+- `DATABASES=/path/to/other.toml` points the agent at a different registry, e.g. per environment.
+
+Tested this way: a `targets` database added only in config, then *"Which sales reps are behind
+their 2026-Q3 revenue target, and by how much?"*. The agent described the three tables it needed,
+pulled revenue per customer from ERP, joined it to CRM account owners through `{{r4}}`, joined
+that to the targets through `{{r5}}`, and named the right four reps.
+
+Only SQLite is supported. Postgres or MySQL would need SQLAlchemy in `run_sql`, `table_names`
+and `describe_tables`; the rest of the agent doesn't depend on the engine.
 
 ## Golden dataset
 
@@ -327,6 +371,7 @@ days late to on time (plus 3 that got worse).
 ```
 agent.py      graph, prompts, streaming CLI, REPL
 tools.py      tool registry and SQL guards
+databases.toml  database registry: paths, descriptions, business context
 seed.py       schema DDL, data generator, self-check
 golden.json   20 questions with reference SQL and expected answers
 eval.py       golden-dataset runner and scorer
