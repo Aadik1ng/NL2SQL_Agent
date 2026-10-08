@@ -7,7 +7,7 @@ evidence. Every thought, query and result is streamed to the terminal.
 ```
 uv sync
 cp .env.example .env          # add OPENROUTER_API_KEY and a LITELLM_MASTER_KEY (+ optional Langfuse keys)
-cp langfuse/.env.example langfuse/.env
+cp infra/langfuse/.env.example infra/langfuse/.env
 docker compose up -d          # once: LiteLLM gateway + Langfuse. Docker restarts them whenever it starts
 uv run seed.py                # builds data/erp.db + data/crm.db (deterministic, as of 2026-10-08)
 uv run agent.py               # interactive; or: uv run agent.py "your question"
@@ -141,7 +141,7 @@ How the requirements map to the loop:
   what it has and say what's missing.
 - **Follow-ups**: an `InMemorySaver` checkpointer keeps the conversation per thread, so
   "now only Pune customers" works in the REPL. `/new` resets.
-- **Schema on demand**: the prompt holds no schema, only the databases from `databases.toml`
+- **Schema on demand**: the prompt holds no schema, only the databases from `config/databases.toml`
   with their table names (about 470 tokens in all). Before querying a table, the agent calls
   `describe_tables`, which returns its DDL, the column comments (status values, how to compute
   days late, which columns link to another database) and 3 sample rows. The registry is re-read
@@ -153,12 +153,12 @@ if self-hosted) and every run is traced in Langfuse through its LangChain callba
 Langfuse locally:
 
 ```
-cp langfuse/.env.example langfuse/.env && docker compose up -d   # UI: http://localhost:3300
+cp infra/langfuse/.env.example infra/langfuse/.env && docker compose up -d   # UI: http://localhost:3300
 ```
 
 If Langfuse isn't reachable, the agent prints one line and runs without tracing.
 
-The org, project, API keys and login (`admin@local.dev` / the password in `langfuse/.env`)
+The org, project, API keys and login (`admin@local.dev` / the password in `infra/langfuse/.env`)
 are created on first start. Put the matching keys in the root `.env` (see `.env.example`).
 `docker-compose.yml` is the official upstream file; `docker-compose.override.yml` moves the UI
 to port 3300 and keeps every port bound to localhost.
@@ -183,7 +183,7 @@ Pydantic AI planner ──────────┼──► LiteLLM proxy :40
 Pydantic AI eval judge ───────┘    aliases, retries, fallback, one key
 ```
 
-- **LiteLLM proxy** (`litellm/config.yaml`) is the only thing that holds the OpenRouter key.
+- **LiteLLM proxy** (`infra/litellm/config.yaml`) is the only thing that holds the OpenRouter key.
   The app authenticates with `LITELLM_MASTER_KEY` and asks for an alias (`claude-haiku`,
   `claude-sonnet`). The proxy retries transient errors twice, then falls back to the other
   model. Switching provider (Anthropic direct, Bedrock, Vertex) or adding a model is a config
@@ -194,7 +194,7 @@ Pydantic AI eval judge ───────┘    aliases, retries, fallback, o
   trace, so one trace shows planner, agent and tools together.
 - The gateway runs as the `litellm` service in the root `docker-compose.yml` (official image, `restart: always`).
   The agent checks it on startup and says what to do if it's down. Without Docker:
-  `uvx --env-file .env --from 'litellm[proxy]' litellm --config litellm/config.yaml --port 4000`.
+  `uvx --env-file .env --from 'litellm[proxy]' litellm --config infra/litellm/config.yaml --port 4000`.
 - **No proxy?** Remove `LLM_BASE_URL`/`LLM_API_KEY` from `.env` and the same code talks to
   OpenRouter directly (`MODEL=anthropic/claude-haiku-4.5`). Both paths use the same
   OpenAI-compatible client, so there's no second code path.
@@ -203,7 +203,7 @@ Pydantic AI eval judge ───────┘    aliases, retries, fallback, o
 
 | Tool | Purpose |
 |---|---|
-| `query_<name>(sql)` | Read-only SQL on one configured database: one tool per entry in `databases.toml`, so `query_erp` and `query_crm` here |
+| `query_<name>(sql)` | Read-only SQL on one configured database: one tool per entry in `config/databases.toml`, so `query_erp` and `query_crm` here |
 | `describe_tables(database, tables)` | DDL, column comments and 3 sample rows for the tables the agent is about to query |
 | `analyze_trends(database, sql, recent_periods)` | Takes `(entity, period, value)` rows; returns slope, recent vs prior average and change per entity |
 | `find_customers_by_criteria(...)` | Customer metrics in one call: invoices in a window, lifetime spend, outstanding, overdue, first/last invoice, dormancy |
@@ -217,11 +217,17 @@ returning `remember(cols, rows)` instead of `to_json(cols, rows)`.
 
 ### Adding a tool
 
-Tools are plain functions in `tools.py`. The type hints become the JSON schema and the
-docstring becomes the description the model reads. Example: add this to `tools.py`
-and add it to the list in `tools_for()`. Nothing else changes.
+Tools are plain functions in `tools/`. The type hints become the JSON schema and the
+docstring becomes the description the model reads. Example: save this as `tools/roi.py`, then
+import it in `tools/__init__.py` and add it to the list in `tools_for()`. Nothing else changes.
 
 ```python
+from langchain_core.tools import tool
+
+from database.executor import run_sql
+from database.references import remember
+
+
 @tool(parse_docstring=True)
 def calculate_roi_by_customer(customer_ids: list[str], months: int = 12, margin_pct: float = 25,
                               cost_per_touch: float = 1500) -> str:
@@ -246,20 +252,22 @@ def calculate_roi_by_customer(customer_ids: list[str], months: int = 12, margin_
         rows.append([cid, revenue.get(cid, 0), margin, touches.get(cid, 0), cost, margin / cost if cost else None])
     return remember(["customer_id", "revenue", "gross_margin", "touches", "sales_cost", "roi_multiple"], rows)
 
-# in tools_for():
-    tools += [describe_tables, analyze_trends, calculate_roi_by_customer]
+# in tools/__init__.py:
+from tools.roi import calculate_roi_by_customer
+...
+    tools += [describe_tables, analyze_trends, calculate_roi_by_customer]   # in tools_for()
 ```
 
 Then ask: *"What's the ROI on sales effort for our top 5 customers?"*
 
 ## Connecting a database
 
-Add an entry to `databases.toml`. That's all: no code change, redeploy or restart, because the
+Add an entry to `config/databases.toml`. That's all: no code change, redeploy or restart, because the
 agent re-reads the file before every question.
 
 ```toml
 [databases.targets]
-path = "data/targets.db"                       # SQLite file, relative to databases.toml
+path = "../data/targets.db"                    # SQLite file, relative to config/databases.toml
 description = "Sales targets per rep and quarter"
 
 [databases.targets.tables]                     # optional: only for tables whose purpose isn't obvious
@@ -287,7 +295,7 @@ and `describe_tables`; the rest of the agent doesn't depend on the engine.
 
 ## Golden dataset
 
-`golden.json` holds 20 questions with known-correct answers: the 5 from the brief plus the
+`evaluation/golden.json` holds 20 questions with known-correct answers: the 5 from the brief plus the
 sales director's question (tagged `spec`), and 14 more covering simple lookups, totals,
 rankings, ERP↔CRM hand-offs, time windows, trends, and traps (duplicate names, customers with
 no CRM record, a question whose correct answer is "nobody"). Each item has:
@@ -327,12 +335,13 @@ Before running, `eval.py` re-runs every reference query and refuses to start if 
 longer matches the frozen answers.
 
 To add a question: append an item with `expected: null`, run `uv run eval.py --freeze`, and
-check the frozen answer by hand. If it needs specific data to exist, plant it in `seed.py`
-(see `PROFILES`) and add it to the self-check at the end of `main()`.
+check the frozen answer by hand. If it needs specific data to exist, plant it in
+`demo_data/` (see `PROFILES` in `catalog.py`) and add it to the self-check at the end of
+`main()` in `generate.py`.
 
 ## Database
 
-Synthetic data: two SQLite files generated by `seed.py`. They aren't from a public
+Synthetic data: two SQLite files generated by `seed.py` (code in `demo_data/`). They aren't from a public
 dataset: names, cities, GSTINs, products and payment behaviour are modelled on an Indian B2B
 industrial distributor. The RNG seed and the dataset's "today" (`meta.as_of` = 2026-10-08) are
 fixed, so every run produces byte-identical files and the golden answers stay valid.
@@ -359,7 +368,7 @@ Realism built in, so naive approaches fail:
 - Payer profiles (prompt vs slow), part payments, some missing reason codes, NULL contact on some activities.
 - Seasonality: Diwali (Oct–Nov) and fiscal year-end (March) peaks, monsoon dip.
 
-Planted groups give the brief's questions known answers, and `seed.py` asserts the golden
+Planted groups give the brief's questions known answers, and the seed asserts the golden
 reference queries return exactly them: 10 enterprise accounts far ahead of everyone else, 7 customers
 who grew from <₹1L to >₹5L orders, 6 repeat customers owing >₹5L with no contact for 30+ days
 (plus 4 decoys contacted recently), 8 customers with 3–5 unpaid invoices, 6 dormant customers
@@ -369,13 +378,23 @@ days late to on time (plus 3 that got worse).
 ## Files
 
 ```
-agent.py      graph, prompts, streaming CLI, REPL
-tools.py      tool registry and SQL guards
-databases.toml  database registry: paths, descriptions, business context
-seed.py       schema DDL, data generator, self-check
-golden.json   20 questions with reference SQL and expected answers
-eval.py       golden-dataset runner and scorer
-docker-compose.yml   LiteLLM gateway + Langfuse in one stack
-litellm/      LiteLLM proxy config (model aliases, retries, fallbacks)
-langfuse/     local Langfuse (official compose file + override)
+agent.py · eval.py · seed.py   entry points (uv run ...)
+docker-compose.yml             LiteLLM gateway + Langfuse in one stack
+
+config/      settings.py: .env, model endpoint, tracing switch · databases.toml: the database registry
+database/    registry.py: read the registry · executor.py: safe read-only SQL ·
+             references.py: {{rN}} results across databases, retype guard, result formatting
+tools/       __init__.py: which tools the agent gets · query.py: query_<name>, describe_tables ·
+             trends.py: analyze_trends · erp.py: helpers for this dataset's ERP
+engine/      prompts.py: everything the model is told · planner.py: Plan + Pydantic AI planner ·
+             graph.py: the plan -> agent <-> tools loop
+cli/         render.py: the live trace in the terminal · app.py: ask() and the interactive session
+evaluation/  golden.json: 20 questions · golden.py: reference answers, scoring ·
+             judge.py: faithfulness judge · runner.py: the eval command
+demo_data/   schema.py: ERP + CRM DDL · catalog.py: names, products, reps · generate.py: build + self-check
+infra/       litellm/config.yaml: model aliases, retries, fallback · langfuse/: compose file + override
 ```
+
+Where to go: connect a database in `config/databases.toml`; add a tool in `tools/`; change how
+the agent reasons or answers in `engine/prompts.py`; add or switch models in
+`infra/litellm/config.yaml` (and `MODEL` in `.env`); add a test question in `evaluation/golden.json`.

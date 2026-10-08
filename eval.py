@@ -1,4 +1,4 @@
-"""Run the golden dataset (golden.json) through the agent and score every answer.
+"""Run the golden dataset (evaluation/golden.json) through the agent and score every answer.
 
     uv run eval.py                  all golden questions
     uv run eval.py G04 G16          by id

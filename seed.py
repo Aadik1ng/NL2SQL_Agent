@@ -1,9 +1,9 @@
 """Build data/erp.db and data/crm.db with realistic, deterministic ERP + CRM data.
 
 The dataset's "today" is pinned (AS_OF, stored in each DB's `meta.as_of`) so every
-run produces byte-identical data and the golden answers in golden.json stay valid.
+run produces byte-identical data and the golden answers in evaluation/golden.json stay valid.
 Some customers and vendors are deliberately planted so the demo questions have known
-answers; their reference queries live in golden.json and are asserted below.
+answers; their reference queries live in evaluation/golden.json and are asserted in demo_data/generate.py.
 
     uv run seed.py                       pinned date
     AS_OF=2027-01-15 uv run seed.py      different "today" (then: uv run eval.py --freeze)
