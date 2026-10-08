@@ -1,0 +1,16 @@
+# Local changes on top of upstream docker-compose.yml (auto-merged by `docker compose`).
+# Web UI on 3300 because 3000 is often taken; nothing reachable from outside this machine;
+# redis/postgres/clickhouse need no host ports (only the Langfuse containers talk to them).
+services:
+  langfuse-web:
+    ports: !override
+      - 127.0.0.1:3300:3000
+  minio:
+    ports: !override
+      - 127.0.0.1:9090:9000
+  redis:
+    ports: !reset []
+  postgres:
+    ports: !reset []
+  clickhouse:
+    ports: !reset []

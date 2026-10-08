@@ -1,0 +1,33 @@
+# LiteLLM proxy: the one gateway every LLM call goes through (LangGraph agent and Pydantic AI).
+# Runs as the `litellm` service in the root docker-compose.yml (docker compose up -d). Without Docker, from the repo root:
+#   uvx --env-file .env --from 'litellm[proxy]' litellm --config litellm/config.yaml --port 4000
+model_list:
+  - model_name: claude-sonnet
+    litellm_params:
+      model: openrouter/anthropic/claude-sonnet-5
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: claude-haiku
+    litellm_params:
+      model: openrouter/anthropic/claude-haiku-4.5
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: gpt-5-mini
+    litellm_params:
+      model: openrouter/openai/gpt-5-mini
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: gpt-5.4-mini
+    litellm_params:
+      model: openrouter/openai/gpt-5.4-mini
+      api_key: os.environ/OPENROUTER_API_KEY
+
+litellm_settings:
+  drop_params: true         # GPT-5 models reject temperature=0; drop params a model doesn't support
+
+router_settings:
+  num_retries: 2            # transient errors (429/5xx/timeouts) retried before falling back
+  timeout: 120
+  fallbacks:                # if a model keeps failing, the call is served by the other one
+    - claude-sonnet: [claude-haiku]
+    - claude-haiku: [claude-sonnet]
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY   # clients authenticate with this; provider keys stay in the proxy
