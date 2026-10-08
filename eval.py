@@ -114,7 +114,7 @@ def main():
                  f"(uv run seed.py) or, if the change is intended, uv run eval.py --freeze")
 
     # imported here so seed.py can use reference_answers() without an API key
-    from agent import MODEL, TRACING, as_of, ask, build_graph, pydantic_model
+    from agent import MODEL, TRACING, as_of, ask, current_graph, pydantic_model
     from langchain_core.messages import AIMessage, ToolMessage
     from pydantic_ai import Agent
 
@@ -136,7 +136,7 @@ def main():
         scores = {"eval_pass": (ok, f"{item['id']}: {detail}")}
         verdict = None
         if judge:
-            messages = build_graph().get_state({"configurable": {"thread_id": thread}}).values["messages"]
+            messages = current_graph().get_state({"configurable": {"thread_id": thread}}).values["messages"]
             calls = {c["id"]: c["args"] for m in messages if isinstance(m, AIMessage) for c in m.tool_calls}
             evidence = "\n\n".join(f"{m.name}({json.dumps(calls.get(m.tool_call_id), ensure_ascii=False)})\n-> {m.content}"
                                     for m in messages if isinstance(m, ToolMessage))

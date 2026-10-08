@@ -1,4 +1,4 @@
-"""Agentic SQL engine: a LangGraph plan -> ReAct loop over separate ERP and CRM databases.
+"""Agentic SQL engine: a LangGraph plan -> ReAct loop over the databases listed in databases.toml.
 
     uv run agent.py "your question"     answer one question
     uv run agent.py                     interactive; follow-ups keep context, /new resets
@@ -7,7 +7,8 @@ LLM calls go to one OpenAI-compatible endpoint: the LiteLLM proxy (LLM_BASE_URL,
 see litellm/config.yaml) or, without it, OpenRouter directly (OPENROUTER_API_KEY). Settings come from the
 environment or .env. Set LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY to trace every run in Langfuse.
 
-LangGraph runs the loop; Pydantic AI produces the typed plan.
+LangGraph runs the loop; Pydantic AI produces the typed plan. The prompt holds no schema: it lists the configured
+databases and their tables, and the agent looks up columns with describe_tables when it needs them.
 """
 import json
 import os
@@ -33,7 +34,7 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 
-from tools import TOOLS, as_of, schema_text
+from tools import REGISTRY, as_of, database_overview, load_registry, tools_for
 
 env_file = Path(__file__).with_name(".env")
 if env_file.exists():
@@ -62,26 +63,30 @@ TRACING = LANGFUSE_KEYS and reachable(os.environ.get("LANGFUSE_BASE_URL", "https
 MAX_TOOL_ROUNDS = 12  # after this the agent must answer with what it has
 console = Console()
 
-SYSTEM = """You are a data analyst agent for an Indian B2B industrial distributor. You answer business questions by \
-querying two separate SQLite databases with tools and reasoning over the results.
+SYSTEM = """You are a data analyst agent. You answer business questions by querying the databases below with tools \
+and reasoning over the results.
+{context}
+Today is {today}. Use this literal date in SQL, never date('now').
 
-Today is {today} (the dataset date). Use this literal date in SQL, never date('now').
-Money is INR. 1 lakh (L) = 100,000; 1 crore (Cr) = 10,000,000.
+Databases (each is a separate SQLite file, so one query can't join across them):
+{databases}
 
-ERP and CRM are SEPARATE databases: one query cannot join across them. To combine them, query one side, take the IDs \
-from the result and pass them into the next query. Every tool result has a result_ref (r1, r2, ...): write \
-{{{{r3.erp_customer_id}}}} inside IN (...) and the tool inserts ALL values of that column from result r3 (not just the 25 \
-rows you were shown), e.g. WHERE customer_id IN ({{{{r3.erp_customer_id}}}}). Never retype IDs from a result. "Not in the \
-other database" questions (anti-joins) work the same way: fetch the other side's IDs, then NOT IN ({{{{rN.column}}}}). Customer names \
-are not unique and are spelled differently in CRM, so always link by ID (customers.id = accounts.erp_customer_id).
+You see only table names here. Before writing SQL against a table, call describe_tables for it: it returns the \
+columns, the comments that explain them (units, allowed values, which columns link to other databases) and sample \
+rows. Never guess a column name.
 
-{schema}"""
+To combine databases, query one side, then pass its IDs into the next query. Every tool result has a result_ref \
+(r1, r2, ...): write {{{{r3.customer_id}}}} inside IN (...) and the tool inserts ALL values of that column from result \
+r3 (not just the rows you were shown), e.g. WHERE erp_customer_id IN ({{{{r3.id}}}}). Never retype IDs from a result. \
+"Not in the other database" questions (anti-joins) work the same way: fetch the other side's IDs, then NOT IN \
+({{{{rN.column}}}}). Names are not reliable join keys across systems; link by the ID columns the schema comments point to."""
 
 PLAN_INSTRUCTIONS = """
 
 Before touching any data, write a plan for the user's latest question. Break it into sub-problems, decide which \
-database or tool each needs, and order the steps (later steps usually need IDs from earlier ones). If a term is vague \
-("repeat", "improved", "small", "top"), choose a concrete definition and say so."""
+database, tables or tool each needs, and order the steps (later steps usually need IDs from earlier ones). Plan at the \
+level of tables: the agent looks up columns before querying. If a term is vague ("repeat", "improved", "small", \
+"top"), choose a concrete definition and say so."""
 
 AGENT_INSTRUCTIONS = """
 
@@ -94,11 +99,10 @@ Work through the plan with tools.
 - If a query errors, read the error, fix the SQL against the schema and retry. Never repeat a failing query unchanged.
 - Prefer one well-aggregated query over many small ones; you see at most 25 rows per result.
 - Do ALL arithmetic in SQL, never in your head: date math with date()/julianday() against today's date (e.g. \
-date(last_touch, '+30 days') AS due_on, julianday('{today}') - julianday(x) AS days_ago), money as \
-ROUND(amount / 100000.0, 2) AS amount_lakhs, percentages, differences. In the answer, copy numbers from results.
+date(last_touch, '+30 days') AS due_on, julianday('{today}') - julianday(x) AS days_ago), unit conversions, \
+percentages, differences. In the answer, copy numbers from results.
 - Every total, count or share you state must come from a query result. Need a total or "how many have X" you \
-haven't computed? Run the SUM/COUNT; never add up rows yourself. Units: 100 lakhs = 1 crore; a column ending in \
-_lakhs is lakhs; never relabel lakhs as crores.
+haven't computed? Run the SUM/COUNT; never add up rows yourself.
 - Sanity-check each result before building on it: does the row count make sense? Missing data is not zero: never \
 COALESCE a missing average or count to 0 inside a comparison; drop entities without data on both sides.
 - Before/after comparisons: compute both sides per entity in ONE GROUP BY with conditional aggregation \
@@ -108,17 +112,17 @@ entity and report the counts.
 sides, and rank by size. Tiny moves are noise, not findings.
 - Time words carry meaning: "started with" = earliest by date, "grew to" = later by date, "last N months" = a \
 date filter. Don't swap them for MIN/MAX of amounts.
-- Use the helper tools (find_customers_by_criteria, find_invoices, analyze_trends) when they fit, raw SQL otherwise.
+- Use the helper tools (e.g. analyze_trends for trends) when they fit, raw SQL otherwise.
 
 When you have enough evidence, reply WITHOUT tool calls with the final answer:
 - Keep it under about 150 words plus one compact table. No preamble ("Perfect", "Now I have"): start with a \
 one-line direct answer.
-- Cite IDs next to names, e.g. "Sharma Traders (C0042)", vendors like V007, invoices like INV-00123.
+- Cite the record ID next to each name, e.g. "Sharma Traders (C0042)".
 - Never state a name, number or date that isn't in a tool result. Need a name? Query it, or show the ID alone.
-- Show the key numbers (₹ in lakhs) and the definitions/assumptions you used.
+- Show the key numbers (in the units the context asks for) and the definitions/assumptions you used.
 - End with one "Why it matters" line and one or two suggested actions.
-- Very last line: "Answer IDs: C0012, C0044" listing only the IDs that ARE the answer (customers, vendors, SKUs or \
-invoices) after applying the threshold you stated, not ones you excluded or mention for contrast. "Answer IDs: none" \
+- Very last line: "Answer IDs: C0012, C0044" listing only the record IDs that ARE the answer after applying the \
+threshold you stated, not ones you excluded or mention for contrast. "Answer IDs: none" \
 if nothing matches or the answer is a single number or name."""
 
 OUT_OF_BUDGET = "\n\nTool budget used up. Give your best final answer now from the evidence so far and say what is missing."
@@ -150,8 +154,16 @@ def pydantic_model(name=None):
     return OpenAIChatModel(name or MODEL, provider=LiteLLMProvider(api_base=LLM_BASE_URL, api_key=LLM_API_KEY))
 
 
+SAVER = InMemorySaver()  # shared across rebuilds, so a conversation survives a databases.toml change
+
+
+def current_graph():
+    """The graph for the databases configured right now; rebuilt only when databases.toml changes."""
+    return build_graph(REGISTRY.read_text())
+
+
 @cache
-def build_graph():
+def build_graph(registry_text):
     if not LLM_API_KEY:
         sys.exit("Set LLM_API_KEY (LiteLLM proxy) or OPENROUTER_API_KEY in your environment or in .env")
     if "localhost" in LLM_BASE_URL and not reachable(LLM_BASE_URL + "/health/liveliness"):
@@ -163,12 +175,15 @@ def build_graph():
         Agent.instrument_all()
     # max_tokens is generous because reasoning models (GPT-5) count their hidden reasoning against it
     llm = ChatOpenAI(model=MODEL, base_url=LLM_BASE_URL, api_key=LLM_API_KEY, temperature=0, max_tokens=16384)
-    system = SYSTEM.format(today=as_of(), schema=schema_text())
+    registry = load_registry()
+    tools = tools_for(registry)
+    context = registry.get("context", "").strip()
+    system = SYSTEM.format(context=f"\n{context}\n" if context else "", today=as_of(), databases=database_overview())
     # Pydantic AI validates the plan and, if a field is missing or malformed, sends the error back for a retry
     planner = Agent(pydantic_model(), output_type=Plan, instructions=system + PLAN_INSTRUCTIONS, retries=2,
                     model_settings={"temperature": 0, "max_tokens": 16384}, name="planner")
-    worker = llm.bind_tools(TOOLS)
-    closer = llm.bind_tools(TOOLS, tool_choice="none")  # tools stay declared because history contains tool calls
+    worker = llm.bind_tools(tools)
+    closer = llm.bind_tools(tools, tool_choice="none")  # tools stay declared because history contains tool calls
 
     def plan(state):
         conversation = "\n\n".join(
@@ -196,20 +211,26 @@ def build_graph():
     graph = StateGraph(State)
     graph.add_node("plan", plan)
     graph.add_node("agent", agent)
-    graph.add_node("tools", ToolNode(TOOLS, handle_tool_errors=True))  # errors go back to the model as messages
+    graph.add_node("tools", ToolNode(tools, handle_tool_errors=True))  # errors go back to the model as messages
     graph.add_edge(START, "plan")
     graph.add_edge("plan", "agent")
     graph.add_conditional_edges("agent", tools_condition)
     graph.add_edge("tools", "agent")
-    return graph.compile(checkpointer=InMemorySaver())
+    return graph.compile(checkpointer=SAVER)
 
 
 def show_observation(msg):
     if msg.status == "error":
         console.print(f"[bold red]Observation (error):[/] {msg.content}")
         return
-    data = json.loads(msg.content)
-    note = f" [yellow]({data['note']})[/]" if "note" in data else ""
+    try:
+        data = json.loads(msg.content)
+    except ValueError:  # text results, e.g. describe_tables schemas
+        tables = [line.split("(")[0].split()[-1] for line in msg.content.splitlines() if line.startswith("CREATE")]
+        summary = f"schema of {', '.join(tables)}" if tables else msg.content.splitlines()[0][:120]
+        console.print(f"[bold blue]Observation:[/] {summary}")
+        return
+    note =f" [yellow]({data['note']})[/]" if "note" in data else ""
     ref = f" {data['result_ref']}" if "result_ref" in data else ""
     console.print(f"[bold blue]Observation{ref}:[/] {data['row_count']} row(s){note}")
     if not data["rows"]:
@@ -224,7 +245,7 @@ def show_observation(msg):
 
 def ask(question, thread_id="cli"):
     """Run one question, streaming the agent's reasoning to the terminal. Returns the final answer text."""
-    graph = build_graph()
+    graph = current_graph()
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 4 * MAX_TOOL_ROUNDS,
               "run_name": "agentic-sql", "metadata": {"langfuse_session_id": thread_id, "langfuse_tags": [MODEL]}}
     if TRACING:
@@ -271,7 +292,8 @@ def main():
     thread = str(uuid.uuid4())
     if LANGFUSE_KEYS and not TRACING:
         console.print("[dim]Langfuse isn't reachable, so tracing is off for this session.[/]")
-    console.print(f"[bold]Agentic SQL engine[/] · data as of {as_of()} · {MODEL}\n"
+    console.print(f"[bold]Agentic SQL engine[/] · databases: {', '.join(load_registry()['databases'])} · "
+                  f"as of {as_of()} · {MODEL}\n"
                   "Ask a question. /new starts a fresh conversation, exit quits.")
     while True:
         try:

@@ -1,23 +1,29 @@
 """Tools the agent can call.
 
-Add a tool: write a function with type hints and a Google-style docstring, decorate it
-with @tool(parse_docstring=True), and append it to TOOLS. The docstring is what the
-model reads to decide when to call it.
+Databases come from databases.toml (see load_registry), re-read before every question: each one gets a
+query_<name> tool, and describe_tables shows its schema on demand.
+
+Add a tool: write a function with type hints and a Google-style docstring, decorate it with
+@tool(parse_docstring=True), and add it to the list in tools_for(). The docstring is what the model reads to decide
+when to call it.
 """
 import itertools
 import json
+import os
 import re
 import sqlite3
 import statistics
 import time
+import tomllib
 from collections import defaultdict
 from contextlib import closing
+from datetime import date
 from pathlib import Path
-from typing import Literal
 
-from langchain_core.tools import tool
+from langchain_core.tools import StructuredTool, tool
 
-DATA = Path(__file__).parent / "data"
+ROOT = Path(__file__).parent
+REGISTRY = Path(os.environ.get("DATABASES", ROOT / "databases.toml"))
 MAX_ROWS = 25  # rows shown to the model; {{rN.col}} references still carry every row
 KEEP_ROWS = 10_000  # rows kept per result for {{rN.column}} references
 TIMEOUT_S = 10
@@ -31,9 +37,21 @@ def _deny_attach(action, *_):
     return sqlite3.SQLITE_DENY if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH) else sqlite3.SQLITE_OK
 
 
-def run_sql(db, sql, params=(), limit=MAX_ROWS):
-    """Execute one statement read-only. Returns (columns, rows) with up to limit+1 rows."""
-    with closing(sqlite3.connect(f"file:{DATA / db}?mode=ro", uri=True)) as conn:
+def load_registry():
+    """The configured databases, context and as-of date, read fresh from databases.toml."""
+    return tomllib.loads(REGISTRY.read_text())
+
+
+def db_path(database):
+    databases = load_registry()["databases"]
+    if database not in databases:
+        raise ValueError(f"unknown database {database!r}; configured: {', '.join(databases)}")
+    return (REGISTRY.parent / databases[database]["path"]).resolve()
+
+
+def run_sql(database, sql, params=(), limit=MAX_ROWS):
+    """Execute one statement read-only on a configured database. Returns (columns, rows), up to limit+1 rows."""
+    with closing(sqlite3.connect(f"file:{db_path(database)}?mode=ro", uri=True)) as conn:
         conn.set_authorizer(_deny_attach)
         deadline = time.monotonic() + TIMEOUT_S
         conn.set_progress_handler(lambda: time.monotonic() > deadline, 10_000)
@@ -70,7 +88,7 @@ def _quote(v):
 
 
 def expand_refs(sql):
-    """Replace {{r3.col}} with the distinct quoted values of `col` from stored result r3 (all rows, not just 100)."""
+    """Replace {{r3.col}} with the distinct quoted values of `col` from stored result r3 (all rows, not just 25)."""
     def values(m):
         ref, col = m.groups()
         if ref not in RESULTS:
@@ -83,38 +101,50 @@ def expand_refs(sql):
     return REF.sub(values, sql)
 
 
-def schema_text():
-    """DDL of both databases (column comments included) for the system prompt."""
-    parts = []
-    for db in ("erp", "crm"):
-        with closing(sqlite3.connect(DATA / f"{db}.db")) as conn:
-            ddl = [r[0] for r in conn.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL")]
-        parts.append(f"### {db.upper()} database (tool: query_{db})\n" + ";\n".join(ddl) + ";")
-    return "\n\n".join(parts)
-
-
 def as_of():
-    return run_sql("erp.db", "SELECT as_of FROM meta")[1][0][0]
+    return load_registry().get("as_of") or date.today().isoformat()
+
+
+def table_names(database):
+    return [r[0] for r in run_sql(database, "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') "
+                                            "AND name NOT LIKE 'sqlite_%' ORDER BY name", limit=10_000)[1]]
+
+
+def database_overview():
+    """One line per configured database for the prompt: tool, description and table names (no columns)."""
+    return "\n".join(f"- {name} (tool query_{name}): {cfg.get('description', '')}. Tables: {', '.join(table_names(name))}"
+                     for name, cfg in load_registry()["databases"].items())
+
+
+def query_tool(name, description):
+    def run(sql: str) -> str:
+        return remember(*run_sql(name, expand_refs(sql), limit=KEEP_ROWS))
+    return StructuredTool.from_function(
+        run, name=f"query_{name}",
+        description=f"Run ONE read-only SQLite statement (SELECT/WITH) on the {name} database: {description}. It can't "
+                    f"reference other databases' tables. May contain {{{{rN.column}}}} to insert every value of a column "
+                    f"from an earlier result, e.g. WHERE id IN ({{{{r2.customer_id}}}}). Returns JSON columns + rows; "
+                    f"you see {MAX_ROWS} rows.")
 
 
 @tool(parse_docstring=True)
-def query_erp(sql: str) -> str:
-    """Run ONE read-only SQLite query on the ERP database (customers, invoices, line_items, payments, inventory, vendors, purchase_orders, view invoice_balance). Returns JSON columns+rows, max 100 rows.
+def describe_tables(database: str, tables: list[str]) -> str:
+    """Show the schema of some tables before querying them: columns, the comments that explain them (units, allowed values, which columns link to other databases) and 3 sample rows each.
 
     Args:
-        sql: A single SQLite SELECT/WITH statement. Cannot reference CRM tables. May contain {{rN.column}} to insert all values of a column from an earlier result, e.g. WHERE id IN ({{r2.erp_customer_id}}).
+        database: A configured database name, e.g. erp.
+        tables: Table or view names in that database.
     """
-    return remember(*run_sql("erp.db", expand_refs(sql), limit=KEEP_ROWS))
-
-
-@tool(parse_docstring=True)
-def query_crm(sql: str) -> str:
-    """Run ONE read-only SQLite query on the CRM database (accounts, contacts, activities, opportunities, nps_responses). Link to ERP only via accounts.erp_customer_id. Returns JSON columns+rows, max 100 rows.
-
-    Args:
-        sql: A single SQLite SELECT/WITH statement. Cannot reference ERP tables. May contain {{rN.column}} to insert all values of a column from an earlier result, e.g. WHERE erp_customer_id IN ({{r1.id}}).
-    """
-    return remember(*run_sql("crm.db", expand_refs(sql), limit=KEEP_ROWS))
+    known = table_names(database)
+    out = []
+    for t in tables:
+        if t not in known:
+            out.append(f"-- {t}: no such table in {database}; tables are {', '.join(known)}")
+            continue
+        ddl = run_sql(database, "SELECT sql FROM sqlite_master WHERE name = ?", (t,))[1][0][0]
+        cols, rows = run_sql(database, f'SELECT * FROM "{t}" LIMIT 3')
+        out.append(f"{ddl};\n-- sample rows: {to_json(cols, rows)}")
+    return "\n\n".join(out)
 
 
 @tool(parse_docstring=True)
@@ -164,7 +194,7 @@ def find_customers_by_criteria(min_invoices_in_window: int = 0, window_days: int
         WHERE invoices_in_window >= :min_inv AND outstanding >= :min_out AND overdue >= :min_overdue
           AND lifetime_spend >= :min_spend {''.join(' AND ' + w for w in where)}
         ORDER BY lifetime_spend DESC"""
-    return remember(*run_sql("erp.db", sql, params, limit=KEEP_ROWS))
+    return remember(*run_sql("erp", sql, params, limit=KEEP_ROWS))
 
 
 @tool(parse_docstring=True)
@@ -201,19 +231,19 @@ def find_invoices(customer_ids: list[str] | None = None, status: list[str] | Non
              " JOIN line_items li ON li.invoice_id = b.invoice_id JOIN inventory inv ON inv.sku = li.sku")
     sql = (f"SELECT b.*{lines[0] if with_line_items else ''} FROM invoice_balance b{lines[1] if with_line_items else ''}"
            f" WHERE {' AND '.join(where)} ORDER BY b.invoice_date DESC")
-    return remember(*run_sql("erp.db", sql, params, limit=KEEP_ROWS))
+    return remember(*run_sql("erp", sql, params, limit=KEEP_ROWS))
 
 
 @tool(parse_docstring=True)
-def analyze_trends(database: Literal["erp", "crm"], sql: str, recent_periods: int = 3) -> str:
+def analyze_trends(database: str, sql: str, recent_periods: int = 3) -> str:
     """Trend analysis over time periods; use it for any 'improved / declined / grew / trend' question. Runs `sql`, which must return exactly 3 columns: entity, period, value. Per entity: slope per period, average of the most recent periods vs the earlier ones, and the change. Sorted by change, most negative first.
 
     Args:
-        database: Which database to run the SQL on.
+        database: A configured database name to run the SQL on.
         sql: Query returning (entity, period, value); period must sort chronologically as text, e.g. strftime('%Y-%m', date).
         recent_periods: How many of the latest periods (across all entities) count as recent.
     """
-    cols, rows = run_sql(f"{database}.db", expand_refs(sql), limit=100_000)
+    cols, rows = run_sql(database, expand_refs(sql), limit=100_000)
     if len(cols) != 3:
         raise ValueError(f"sql must return 3 columns (entity, period, value), got {cols}")
     periods = sorted({str(r[1]) for r in rows})
@@ -241,4 +271,11 @@ def analyze_trends(database: Literal["erp", "crm"], sql: str, recent_periods: in
     return json.dumps(result)
 
 
-TOOLS = [query_erp, query_crm, find_customers_by_criteria, find_invoices, analyze_trends]
+def tools_for(registry):
+    """Tools for the configured databases. The two ERP helpers are written for this dataset's ERP schema, so they're
+    offered only when an `erp` database is configured."""
+    tools = [query_tool(name, cfg.get("description", "")) for name, cfg in registry["databases"].items()]
+    tools += [describe_tables, analyze_trends]
+    if "erp" in registry["databases"]:
+        tools += [find_customers_by_criteria, find_invoices]
+    return tools
