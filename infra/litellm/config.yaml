@@ -1,6 +1,6 @@
 # LiteLLM proxy: the one gateway every LLM call goes through (LangGraph agent and Pydantic AI).
 # Runs as the `litellm` service in the root docker-compose.yml (docker compose up -d). Without Docker, from the repo root:
-#   uvx --env-file .env --from 'litellm[proxy]' litellm --config litellm/config.yaml --port 4000
+#   uvx --env-file .env --from 'litellm[proxy]' litellm --config infra/litellm/config.yaml --port 4000
 model_list:
   - model_name: claude-sonnet
     litellm_params:

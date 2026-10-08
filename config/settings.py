@@ -1,8 +1,8 @@
 """Runtime settings, read from the environment and the project's .env file.
 
-LLM calls go to one OpenAI-compatible endpoint: the LiteLLM proxy (LLM_BASE_URL, LLM_API_KEY, MODEL = proxy alias, see
-litellm/config.yaml) or, without it, OpenRouter directly (OPENROUTER_API_KEY). Langfuse tracing is on when its keys
-are set and the server answers.
+LLM calls go to one OpenAI-compatible endpoint: the LiteLLM proxy (LLM_BASE_URL, LLM_API_KEY, MODEL = proxy alias,
+see infra/litellm/config.yaml) or, without it, OpenRouter directly (OPENROUTER_API_KEY). Langfuse tracing is on when
+its keys are set and the server answers.
 """
 import os
 import urllib.request
