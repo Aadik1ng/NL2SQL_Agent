@@ -126,9 +126,14 @@ def table_names(database):
 
 
 def database_overview():
-    """One line per configured database for the prompt: tool, description and table names (no columns)."""
-    return "\n".join(f"- {name} (tool query_{name}): {cfg.get('description', '')}. Tables: {', '.join(table_names(name))}"
-                     for name, cfg in load_registry()["databases"].items())
+    """A few lines per configured database for the prompt: tool, description and tables (no columns). Tables get the
+    optional one-line descriptions from databases.toml, for ones whose purpose isn't obvious from the name."""
+    lines = []
+    for name, cfg in load_registry()["databases"].items():
+        notes = cfg.get("tables", {})
+        tables = ", ".join(f"{t} ({notes[t]})" if t in notes else t for t in table_names(name))
+        lines.append(f"- {name} (tool query_{name}): {cfg.get('description', '')}. Tables: {tables}")
+    return "\n".join(lines)
 
 
 def check_not_retyped(sql):
