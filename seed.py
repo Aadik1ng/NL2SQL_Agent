@@ -1,11 +1,12 @@
 """Build data/erp.db and data/crm.db with realistic, deterministic ERP + CRM data.
 
 The dataset's "today" is pinned (AS_OF, stored in each DB's `meta.as_of`) so every
-run produces byte-identical data. Some customers and vendors are deliberately planted
-so the brief's questions have known answers.
+run produces byte-identical data and the golden answers in golden.json stay valid.
+Some customers and vendors are deliberately planted so the demo questions have known
+answers; their reference queries live in golden.json and are asserted below.
 
     uv run seed.py                       pinned date
-    AS_OF=2027-01-15 uv run seed.py      different "today"
+    AS_OF=2027-01-15 uv run seed.py      different "today" (then: uv run eval.py --freeze)
 """
 import os
 import random
@@ -555,11 +556,20 @@ def main():
     erp.commit()
     crm.commit()
 
+    # --- self-check: golden reference queries must return exactly the planted sets
+    from eval import reference_answers
+    planted = {p: {s["id"] for s in specs if s["profile"] == p} for p, _ in PROFILES}
+    expected = {"G01": planted["headline"], "G02": planted["enterprise"], "G03": planted["grower"],
+                "G04": {v["id"] for v in improving}, "G05": planted["unpaid3"], "G06": planted["dormant_big"]}
+    actual = reference_answers()
+    for key, want in expected.items():
+        assert set(actual[key]) == want, f"{key}: planted {sorted(want)} but reference SQL gives {actual[key]}"
+
     for db, name in ((erp, "erp"), (crm, "crm")):
         tables = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name != 'meta'")]
         print(f"{name}.db: " + ", ".join(f"{t}={db.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]}"
                                          for t in tables))
-    print(f"as_of {TODAY}")
+    print(f"as_of {TODAY}; planted cohorts verified: " + ", ".join(f"{k}={len(v)}" for k, v in expected.items()))
 
 
 if __name__ == "__main__":

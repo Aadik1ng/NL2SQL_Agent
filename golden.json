@@ -1,0 +1,487 @@
+[
+  {
+    "id": "G01",
+    "tags": [
+      "spec",
+      "cross-db",
+      "temporal",
+      "multi-part"
+    ],
+    "difficulty": "hard",
+    "answer_type": "ids",
+    "id_type": "customer",
+    "question": "Which repeat customers from the last 6 months with more than ₹5L outstanding haven't been contacted in 30 days, and which products are they buying?",
+    "notes": "repeat = 2+ invoices in the last 6 months; outstanding = unpaid balance on all invoices; contact = any CRM activity. 4 decoys owe as much but were contacted recently; one answer shares its name with another customer.",
+    "reference_sql": [
+      "WITH recent AS (SELECT customer_id, COUNT(*) n FROM invoices",
+      "                WHERE invoice_date >= date(:as_of, '-6 months') GROUP BY customer_id),",
+      "     owed AS (SELECT customer_id, SUM(balance) outstanding FROM invoice_balance GROUP BY customer_id),",
+      "     touch AS (SELECT a.erp_customer_id cid, MAX(substr(t.occurred_at, 1, 10)) last",
+      "               FROM crm.activities t JOIN crm.accounts a ON a.id = t.account_id GROUP BY a.erp_customer_id)",
+      "SELECT r.customer_id FROM recent r JOIN owed o USING (customer_id)",
+      "LEFT JOIN touch ON touch.cid = r.customer_id",
+      "WHERE r.n >= 2 AND o.outstanding > 500000 AND (touch.last IS NULL OR touch.last < date(:as_of, '-30 days'))"
+    ],
+    "expected": [
+      "C0017",
+      "C0029",
+      "C0088",
+      "C0106",
+      "C0144",
+      "C0156"
+    ]
+  },
+  {
+    "id": "G02",
+    "tags": [
+      "spec",
+      "cross-db",
+      "ranking",
+      "temporal"
+    ],
+    "difficulty": "hard",
+    "answer_type": "ids",
+    "id_type": "customer",
+    "question": "Which SKUs did our top 10 customers buy, and what was their NPS when they bought?",
+    "notes": "top 10 by total invoiced; the 10 enterprise accounts are far ahead under any time window. NPS 'when they bought' = nearest survey before/around the purchase.",
+    "reference_sql": [
+      "SELECT customer_id FROM invoices GROUP BY customer_id ORDER BY SUM(total_amount) DESC LIMIT 10"
+    ],
+    "expected": [
+      "C0001",
+      "C0004",
+      "C0005",
+      "C0008",
+      "C0009",
+      "C0010",
+      "C0021",
+      "C0025",
+      "C0027",
+      "C0030"
+    ]
+  },
+  {
+    "id": "G03",
+    "tags": [
+      "spec",
+      "cross-db",
+      "temporal"
+    ],
+    "difficulty": "hard",
+    "answer_type": "ids",
+    "id_type": "customer",
+    "question": "Show me customers who started with small orders (<₹1L) but grew to >₹5L, their sales rep, and when they're due for a check-in.",
+    "notes": "started = first invoice by date < ₹1L; grew = a later invoice > ₹5L. Check-in due = last activity + account checkin_cadence_days.",
+    "reference_sql": [
+      "WITH firsts AS (SELECT customer_id, total_amount FROM invoices i",
+      "                WHERE invoice_date = (SELECT MIN(invoice_date) FROM invoices WHERE customer_id = i.customer_id))",
+      "SELECT customer_id FROM invoices GROUP BY customer_id",
+      "HAVING MAX(total_amount) > 500000",
+      "   AND (SELECT MIN(total_amount) FROM firsts f WHERE f.customer_id = invoices.customer_id) < 100000"
+    ],
+    "expected": [
+      "C0051",
+      "C0055",
+      "C0064",
+      "C0068",
+      "C0073",
+      "C0085",
+      "C0125"
+    ]
+  },
+  {
+    "id": "G04",
+    "tags": [
+      "spec",
+      "trend",
+      "temporal"
+    ],
+    "difficulty": "hard",
+    "answer_type": "ids",
+    "id_type": "vendor",
+    "question": "Which vendors have improved payment timeliness in the last 3 months, and which invoices drove that change?",
+    "notes": "days late = paid_on - bill_due_date on purchase_orders; improved = recent average at least 10 days better than the prior 9 months. 3 decoy vendors got worse.",
+    "reference_sql": [
+      "SELECT vendor_id FROM purchase_orders",
+      "WHERE paid_on IS NOT NULL AND bill_due_date >= date(:as_of, '-12 months')",
+      "GROUP BY vendor_id",
+      "HAVING AVG(CASE WHEN bill_due_date >= date(:as_of, '-3 months')",
+      "                THEN julianday(paid_on) - julianday(bill_due_date) END)",
+      "    <= AVG(CASE WHEN bill_due_date < date(:as_of, '-3 months')",
+      "                THEN julianday(paid_on) - julianday(bill_due_date) END) - 10"
+    ],
+    "expected": [
+      "V007",
+      "V031",
+      "V033",
+      "V048"
+    ]
+  },
+  {
+    "id": "G05",
+    "tags": [
+      "spec",
+      "cross-db"
+    ],
+    "difficulty": "medium",
+    "answer_type": "ids",
+    "id_type": "customer",
+    "question": "Customers with 3+ unpaid invoices — show me the reason codes and when they last engaged with sales.",
+    "notes": "unpaid = invoice with a balance (unpaid or partial). Some reason codes are NULL (not recorded).",
+    "reference_sql": [
+      "SELECT customer_id FROM invoice_balance WHERE balance > 0 GROUP BY customer_id HAVING COUNT(*) >= 3"
+    ],
+    "expected": [
+      "C0015",
+      "C0039",
+      "C0043",
+      "C0076",
+      "C0077",
+      "C0089",
+      "C0095",
+      "C0172"
+    ]
+  },
+  {
+    "id": "G06",
+    "tags": [
+      "spec",
+      "cross-db",
+      "temporal",
+      "calculation"
+    ],
+    "difficulty": "hard",
+    "answer_type": "ids",
+    "id_type": "customer",
+    "question": "Find dormant customers (no purchase in 6+ months) who spent >₹10L historically and calculate win-back opportunity.",
+    "notes": "dormant = last invoice older than 6 months; lifetime spend > ₹10L. Small dormant customers are decoys. Some have open win_back opportunities in CRM.",
+    "reference_sql": [
+      "SELECT customer_id FROM invoices GROUP BY customer_id",
+      "HAVING MAX(invoice_date) < date(:as_of, '-6 months') AND SUM(total_amount) > 1000000"
+    ],
+    "expected": [
+      "C0003",
+      "C0006",
+      "C0022",
+      "C0050",
+      "C0053",
+      "C0074"
+    ]
+  },
+  {
+    "id": "G07",
+    "tags": [
+      "lookup"
+    ],
+    "difficulty": "easy",
+    "answer_type": "ids",
+    "id_type": "customer",
+    "question": "List all our customers based in Pune.",
+    "notes": "Single-table lookup. Two Pune customers share their names with customers in other cities.",
+    "reference_sql": [
+      "SELECT id FROM customers WHERE city = 'Pune'"
+    ],
+    "expected": [
+      "C0015",
+      "C0035",
+      "C0044",
+      "C0046",
+      "C0048",
+      "C0050",
+      "C0054",
+      "C0065",
+      "C0090",
+      "C0096",
+      "C0139",
+      "C0162",
+      "C0188",
+      "C0201",
+      "C0202",
+      "C0206"
+    ]
+  },
+  {
+    "id": "G08",
+    "tags": [
+      "aggregation",
+      "temporal"
+    ],
+    "difficulty": "easy",
+    "answer_type": "value",
+    "tolerance_pct": 1,
+    "question": "How much did we invoice in total over the last 12 months?",
+    "notes": "Sum of invoices.total_amount in the window, any payment status.",
+    "reference_sql": [
+      "SELECT ROUND(SUM(total_amount), 2) FROM invoices WHERE invoice_date >= date(:as_of, '-12 months')"
+    ],
+    "expected": 372725775.91
+  },
+  {
+    "id": "G09",
+    "tags": [
+      "aggregation"
+    ],
+    "difficulty": "easy",
+    "answer_type": "value",
+    "tolerance_pct": 1,
+    "question": "How much money do customers currently owe us on overdue invoices?",
+    "notes": "Balance after payments (part payments count) on invoices past their due date.",
+    "reference_sql": [
+      "SELECT ROUND(SUM(balance), 2) FROM invoice_balance WHERE balance > 0 AND days_past_due > 0"
+    ],
+    "expected": 11158599.48
+  },
+  {
+    "id": "G10",
+    "tags": [
+      "ranking",
+      "temporal"
+    ],
+    "difficulty": "medium",
+    "answer_type": "ids",
+    "id_type": "sku",
+    "question": "Which 5 SKUs brought in the most revenue in the last 6 months?",
+    "notes": "Revenue = SUM(line_items.amount) by invoice date.",
+    "reference_sql": [
+      "SELECT li.sku FROM line_items li JOIN invoices i ON i.id = li.invoice_id",
+      "WHERE i.invoice_date >= date(:as_of, '-6 months')",
+      "GROUP BY li.sku ORDER BY SUM(li.amount) DESC LIMIT 5"
+    ],
+    "expected": [
+      "BRG-105",
+      "LUB-104",
+      "PIP-105",
+      "PKG-103",
+      "PKG-104"
+    ]
+  },
+  {
+    "id": "G11",
+    "tags": [
+      "lookup",
+      "multi-part"
+    ],
+    "difficulty": "easy",
+    "answer_type": "ids",
+    "id_type": "sku",
+    "question": "Which products are below their reorder level, and which vendor supplies each?",
+    "notes": "stock_qty < reorder_level; supplier from inventory.vendor_id.",
+    "reference_sql": [
+      "SELECT sku FROM inventory WHERE stock_qty < reorder_level"
+    ],
+    "expected": [
+      "PPE-105",
+      "VLV-105"
+    ]
+  },
+  {
+    "id": "G12",
+    "tags": [
+      "ranking",
+      "crm"
+    ],
+    "difficulty": "easy",
+    "answer_type": "text",
+    "question": "Which sales rep owns the most Strategic-tier accounts?",
+    "notes": "CRM-only question.",
+    "reference_sql": [
+      "SELECT owner_rep FROM crm.accounts WHERE tier = 'Strategic' GROUP BY owner_rep ORDER BY COUNT(*) DESC LIMIT 1"
+    ],
+    "expected": "Sneha Kulkarni"
+  },
+  {
+    "id": "G13",
+    "tags": [
+      "cross-db",
+      "temporal"
+    ],
+    "difficulty": "medium",
+    "answer_type": "ids",
+    "id_type": "customer",
+    "question": "Which Enterprise customers gave a detractor NPS score (6 or below) in the last 6 months?",
+    "notes": "Segment lives in ERP, NPS in CRM: needs an ID hand-off.",
+    "reference_sql": [
+      "SELECT DISTINCT a.erp_customer_id FROM crm.nps_responses n",
+      "JOIN crm.accounts a ON a.id = n.account_id JOIN customers c ON c.id = a.erp_customer_id",
+      "WHERE c.segment = 'Enterprise' AND n.score <= 6 AND n.responded_on >= date(:as_of, '-6 months')"
+    ],
+    "expected": [
+      "C0001",
+      "C0004",
+      "C0005",
+      "C0010",
+      "C0021"
+    ]
+  },
+  {
+    "id": "G14",
+    "tags": [
+      "cross-db",
+      "temporal"
+    ],
+    "difficulty": "hard",
+    "answer_type": "ids",
+    "id_type": "customer",
+    "question": "Which customers have an open sales opportunity but haven't placed an order in the last 90 days?",
+    "notes": "open = stage prospecting/proposal/negotiation. CRM prospects with no ERP record are not customers. Two customers have duplicate CRM accounts.",
+    "reference_sql": [
+      "SELECT DISTINCT a.erp_customer_id FROM crm.opportunities o JOIN crm.accounts a ON a.id = o.account_id",
+      "WHERE o.stage IN ('prospecting', 'proposal', 'negotiation') AND a.erp_customer_id IS NOT NULL",
+      "  AND (SELECT MAX(invoice_date) FROM invoices WHERE customer_id = a.erp_customer_id) < date(:as_of, '-90 days')"
+    ],
+    "expected": [
+      "C0003",
+      "C0006",
+      "C0022",
+      "C0028",
+      "C0029",
+      "C0033",
+      "C0037",
+      "C0040",
+      "C0045",
+      "C0084",
+      "C0088",
+      "C0104"
+    ]
+  },
+  {
+    "id": "G15",
+    "tags": [
+      "ranking",
+      "temporal",
+      "calculation"
+    ],
+    "difficulty": "hard",
+    "answer_type": "ids",
+    "id_type": "customer",
+    "question": "Which 3 customers paid us furthest past the due date on average over the last 12 months? Count only fully paid invoices (at least 3 per customer) and use the final payment date.",
+    "notes": "days late = final payment date - due_date, invoices dated in the last 12 months.",
+    "reference_sql": [
+      "SELECT i.customer_id FROM invoices i",
+      "JOIN (SELECT invoice_id, MAX(paid_on) AS last_paid FROM payments GROUP BY invoice_id) p ON p.invoice_id = i.id",
+      "WHERE i.status = 'paid' AND i.invoice_date >= date(:as_of, '-12 months')",
+      "GROUP BY i.customer_id HAVING COUNT(*) >= 3",
+      "ORDER BY AVG(julianday(p.last_paid) - julianday(i.due_date)) DESC LIMIT 3"
+    ],
+    "expected": [
+      "C0016",
+      "C0090",
+      "C0185"
+    ]
+  },
+  {
+    "id": "G16",
+    "tags": [
+      "aggregation",
+      "data-quality"
+    ],
+    "difficulty": "medium",
+    "answer_type": "value",
+    "tolerance_pct": 1,
+    "question": "How much does Vikas Machine Tools in Surat currently owe us?",
+    "notes": "Trap: two customers are called 'Vikas Machine Tools' (Pune and Surat).",
+    "reference_sql": [
+      "SELECT ROUND(SUM(b.balance), 2) FROM invoice_balance b JOIN customers c ON c.id = b.customer_id",
+      "WHERE c.name = 'Vikas Machine Tools' AND c.city = 'Surat'"
+    ],
+    "expected": 175838.1
+  },
+  {
+    "id": "G17",
+    "tags": [
+      "cross-db"
+    ],
+    "difficulty": "medium",
+    "answer_type": "ids",
+    "id_type": "customer",
+    "question": "Which customers have given us a promoter NPS score (9 or 10) but currently have an overdue invoice?",
+    "notes": "Promoter at any time; overdue = balance on an invoice past due.",
+    "reference_sql": [
+      "SELECT DISTINCT a.erp_customer_id FROM crm.nps_responses n JOIN crm.accounts a ON a.id = n.account_id",
+      "WHERE n.score >= 9 AND a.erp_customer_id IN",
+      "      (SELECT customer_id FROM invoice_balance WHERE balance > 0 AND days_past_due > 0)"
+    ],
+    "expected": [
+      "C0015",
+      "C0017",
+      "C0036",
+      "C0077",
+      "C0156",
+      "C0157",
+      "C0165"
+    ]
+  },
+  {
+    "id": "G18",
+    "tags": [
+      "data-quality",
+      "empty-answer"
+    ],
+    "difficulty": "medium",
+    "answer_type": "ids",
+    "id_type": "customer",
+    "question": "Which customers in Delhi owe us more than ₹1 crore?",
+    "notes": "Correct answer is nobody. Tests that the agent says so instead of stretching.",
+    "reference_sql": [
+      "SELECT c.id FROM customers c JOIN invoice_balance b ON b.customer_id = c.id",
+      "WHERE c.city = 'Delhi' GROUP BY c.id HAVING SUM(b.balance) > 10000000"
+    ],
+    "expected": []
+  },
+  {
+    "id": "G19",
+    "tags": [
+      "cross-db",
+      "temporal",
+      "data-quality"
+    ],
+    "difficulty": "hard",
+    "answer_type": "ids",
+    "id_type": "customer",
+    "question": "Which customers have had no sales activity logged in the last 200 days, including customers with no CRM record at all?",
+    "notes": "Trap: 8 ERP customers have no CRM account and must be included; 2 customers have two CRM accounts (use the latest activity across both).",
+    "reference_sql": [
+      "SELECT c.id FROM customers c",
+      "LEFT JOIN crm.accounts a ON a.erp_customer_id = c.id LEFT JOIN crm.activities t ON t.account_id = a.id",
+      "GROUP BY c.id HAVING MAX(t.occurred_at) IS NULL OR MAX(t.occurred_at) < date(:as_of, '-200 days')"
+    ],
+    "expected": [
+      "C0003",
+      "C0037",
+      "C0042",
+      "C0065",
+      "C0067",
+      "C0070",
+      "C0071",
+      "C0126",
+      "C0138",
+      "C0148",
+      "C0163",
+      "C0190",
+      "C0213"
+    ]
+  },
+  {
+    "id": "G20",
+    "tags": [
+      "ranking",
+      "multi-step"
+    ],
+    "difficulty": "medium",
+    "answer_type": "ids",
+    "id_type": "vendor",
+    "question": "Which vendors supply our top 3 SKUs by revenue over the last 12 months?",
+    "notes": "Top SKUs from line_items, supplier from inventory.vendor_id.",
+    "reference_sql": [
+      "SELECT DISTINCT vendor_id FROM inventory WHERE sku IN (",
+      "  SELECT li.sku FROM line_items li JOIN invoices i ON i.id = li.invoice_id",
+      "  WHERE i.invoice_date >= date(:as_of, '-12 months')",
+      "  GROUP BY li.sku ORDER BY SUM(li.amount) DESC LIMIT 3)"
+    ],
+    "expected": [
+      "V010",
+      "V037",
+      "V055"
+    ]
+  }
+]
