@@ -79,7 +79,10 @@ To combine databases, query one side, then pass its IDs into the next query. Eve
 (r1, r2, ...): write {{{{r3.customer_id}}}} inside IN (...) and the tool inserts ALL values of that column from result \
 r3 (not just the rows you were shown), e.g. WHERE erp_customer_id IN ({{{{r3.id}}}}). Never retype IDs from a result. \
 "Not in the other database" questions (anti-joins) work the same way: fetch the other side's IDs, then NOT IN \
-({{{{rN.column}}}}). Names are not reliable join keys across systems; link by the ID columns the schema comments point to."""
+({{{{rN.column}}}}). To group or join by a column that lives in another database (e.g. revenue per CRM sales rep), \
+fetch the mapping there, then use the whole result as a table: JOIN {{{{r3}}}} AS m ON m.erp_customer_id = \
+i.customer_id ... GROUP BY m.owner_rep. Names are not reliable join keys across systems; link by the ID columns the \
+schema comments point to."""
 
 PLAN_INSTRUCTIONS = """
 

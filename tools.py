@@ -29,7 +29,7 @@ KEEP_ROWS = 10_000  # rows kept per result for {{rN.column}} references
 TIMEOUT_S = 10
 RESULTS = {}  # ponytail: every result kept for the process lifetime; fine for a CLI, add eviction for a server
 _refs = itertools.count(1)
-REF = re.compile(r"\{\{(r\d+)\.(\w+)\}\}")
+REF = re.compile(r"\{\{(r\d+)(?:\.(\w+))?\}\}")  # {{r3.col}} = a column's values, {{r3}} = the whole result
 
 
 def _deny_attach(action, *_):
@@ -71,8 +71,8 @@ def to_json(cols, rows, ref=None):
         out["result_ref"] = ref
     if len(rows) > MAX_ROWS:
         total = f"{KEEP_ROWS}+" if len(rows) > KEEP_ROWS else len(rows)
-        out["note"] = (f"showing {MAX_ROWS} of {total} rows; aggregate in SQL, or pass a whole column on with "
-                       f"{{{{{ref}.<column>}}}}")
+        out["note"] = (f"showing {MAX_ROWS} of {total} rows; aggregate in SQL, or use all rows in a later query: "
+                       f"{{{{{ref}.<column>}}}} for a list, {{{{{ref}}}}} as a table")
     return json.dumps(out, default=str, ensure_ascii=False)
 
 
@@ -84,16 +84,31 @@ def remember(cols, rows):
 
 
 def _quote(v):
+    if v is None:
+        return "NULL"
     return str(v) if isinstance(v, (int, float)) else "'" + str(v).replace("'", "''") + "'"
 
 
+def _as_table(cols, rows):
+    """A stored result as an inline table with its own column names, usable in FROM/JOIN of any database."""
+    if not rows:
+        return "(SELECT " + ", ".join(f'NULL AS "{c}"' for c in cols) + " WHERE 0)"
+    names = ", ".join(f'column{i + 1} AS "{c}"' for i, c in enumerate(cols))
+    tuples = ", ".join("(" + ", ".join(_quote(v) for v in r) + ")" for r in rows)
+    return f"(SELECT {names} FROM (VALUES {tuples}))"
+
+
 def expand_refs(sql):
-    """Replace {{r3.col}} with the distinct quoted values of `col` from stored result r3 (all rows, not just 25)."""
+    """{{r3.col}} -> the distinct quoted values of `col` in stored result r3, for IN (...).
+    {{r3}} -> the whole of r3 as a table, for joining or grouping by columns that live in another database.
+    Both use every stored row, not just the ones the model was shown."""
     def values(m):
         ref, col = m.groups()
         if ref not in RESULTS:
             raise ValueError(f"unknown result {ref}; available: {', '.join(RESULTS) or 'none'}")
         cols, rows = RESULTS[ref]
+        if col is None:
+            return _as_table(cols, rows)
         if col not in cols:
             raise ValueError(f"{ref} has no column {col!r}; its columns are {cols}")
         i = cols.index(col)
@@ -116,15 +131,24 @@ def database_overview():
                      for name, cfg in load_registry()["databases"].items())
 
 
+def check_not_retyped(sql):
+    """Reject queries that carry an earlier result as hand-typed literals: models drop or invent rows when copying."""
+    if len(re.findall(r"'[^']*'", sql)) > 25 and not REF.search(sql):
+        raise ValueError("This query retypes many values by hand. Use {{rN.column}} for a list of values or {{rN}} for "
+                         "a whole earlier result as a table; copied data gets rows dropped or invented.")
+
+
 def query_tool(name, description):
     def run(sql: str) -> str:
+        check_not_retyped(sql)
         return remember(*run_sql(name, expand_refs(sql), limit=KEEP_ROWS))
     return StructuredTool.from_function(
         run, name=f"query_{name}",
         description=f"Run ONE read-only SQLite statement (SELECT/WITH) on the {name} database: {description}. It can't "
-                    f"reference other databases' tables. May contain {{{{rN.column}}}} to insert every value of a column "
-                    f"from an earlier result, e.g. WHERE id IN ({{{{r2.customer_id}}}}). Returns JSON columns + rows; "
-                    f"you see {MAX_ROWS} rows.")
+                    f"reference other databases' tables, but it can use earlier results from any database: "
+                    f"{{{{rN.column}}}} inserts every value of a column (WHERE id IN ({{{{r2.customer_id}}}})) and "
+                    f"{{{{rN}}}} inserts a whole result as a table (JOIN {{{{r2}}}} AS m ON m.customer_id = t.id). "
+                    f"Returns JSON columns + rows; you see {MAX_ROWS} rows.")
 
 
 @tool(parse_docstring=True)
