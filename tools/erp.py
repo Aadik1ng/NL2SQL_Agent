@@ -1,53 +1,8 @@
-"""Tools the agent can call.
+"""Helpers written for this dataset's ERP schema. tools_for() offers them only when an `erp` database is configured."""
+from langchain_core.tools import tool
 
-Databases come from databases.toml (see load_registry), re-read before every question: each one gets a
-query_<name> tool, and describe_tables shows its schema on demand.
-
-Add a tool: write a function with type hints and a Google-style docstring, decorate it with
-@tool(parse_docstring=True), and add it to the list in tools_for(). The docstring is what the model reads to decide
-when to call it.
-"""
-import json
-import statistics
-from collections import defaultdict
-
-from langchain_core.tools import StructuredTool, tool
-
-from database.executor import run_sql, table_names
-from database.references import KEEP_ROWS, MAX_ROWS, check_not_retyped, expand_refs, remember, to_json
-
-
-def query_tool(name, description):
-    def run(sql: str) -> str:
-        check_not_retyped(sql)
-        return remember(*run_sql(name, expand_refs(sql), limit=KEEP_ROWS))
-    return StructuredTool.from_function(
-        run, name=f"query_{name}",
-        description=f"Run ONE read-only SQLite statement (SELECT/WITH) on the {name} database: {description}. It can't "
-                    f"reference other databases' tables, but it can use earlier results from any database: "
-                    f"{{{{rN.column}}}} inserts every value of a column (WHERE id IN ({{{{r2.customer_id}}}})) and "
-                    f"{{{{rN}}}} inserts a whole result as a table (JOIN {{{{r2}}}} AS m ON m.customer_id = t.id). "
-                    f"Returns JSON columns + rows; you see {MAX_ROWS} rows.")
-
-
-@tool(parse_docstring=True)
-def describe_tables(database: str, tables: list[str]) -> str:
-    """Show the schema of some tables before querying them: columns, the comments that explain them (units, allowed values, which columns link to other databases) and 3 sample rows each.
-
-    Args:
-        database: A configured database name, e.g. erp.
-        tables: Table or view names in that database.
-    """
-    known = table_names(database)
-    out = []
-    for t in tables:
-        if t not in known:
-            out.append(f"-- {t}: no such table in {database}; tables are {', '.join(known)}")
-            continue
-        ddl = run_sql(database, "SELECT sql FROM sqlite_master WHERE name = ?", (t,))[1][0][0]
-        cols, rows = run_sql(database, f'SELECT * FROM "{t}" LIMIT 3')
-        out.append(f"{ddl};\n-- sample rows: {to_json(cols, rows)}")
-    return "\n\n".join(out)
+from database.executor import run_sql
+from database.references import KEEP_ROWS, remember
 
 
 @tool(parse_docstring=True)
@@ -135,50 +90,3 @@ def find_invoices(customer_ids: list[str] | None = None, status: list[str] | Non
     sql = (f"SELECT b.*{lines[0] if with_line_items else ''} FROM invoice_balance b{lines[1] if with_line_items else ''}"
            f" WHERE {' AND '.join(where)} ORDER BY b.invoice_date DESC")
     return remember(*run_sql("erp", sql, params, limit=KEEP_ROWS))
-
-
-@tool(parse_docstring=True)
-def analyze_trends(database: str, sql: str, recent_periods: int = 3) -> str:
-    """Trend analysis over time periods; use it for any 'improved / declined / grew / trend' question. Runs `sql`, which must return exactly 3 columns: entity, period, value. Per entity: slope per period, average of the most recent periods vs the earlier ones, and the change. Sorted by change, most negative first.
-
-    Args:
-        database: A configured database name to run the SQL on.
-        sql: Query returning (entity, period, value); period must sort chronologically as text, e.g. strftime('%Y-%m', date).
-        recent_periods: How many of the latest periods (across all entities) count as recent.
-    """
-    cols, rows = run_sql(database, expand_refs(sql), limit=100_000)
-    if len(cols) != 3:
-        raise ValueError(f"sql must return 3 columns (entity, period, value), got {cols}")
-    periods = sorted({str(r[1]) for r in rows})
-    recent = set(periods[-recent_periods:])
-    series = defaultdict(dict)
-    for entity, period, value in rows:
-        if value is not None:
-            series[entity][str(period)] = float(value)
-    out = []
-    for entity, points in series.items():
-        ps = sorted(points)
-        now = [points[p] for p in ps if p in recent]
-        before = [points[p] for p in ps if p not in recent]
-        slope = statistics.linear_regression([periods.index(p) for p in ps], [points[p] for p in ps]).slope \
-            if len(ps) > 1 else None
-        recent_avg = statistics.fmean(now) if now else None
-        prior_avg = statistics.fmean(before) if before else None
-        change = recent_avg - prior_avg if now and before else None
-        out.append([entity, len(ps), prior_avg, recent_avg, change,
-                    change / abs(prior_avg) * 100 if change is not None and prior_avg else None, slope])
-    out.sort(key=lambda r: (r[4] is None, r[4]))
-    result = json.loads(remember(["entity", "n_periods", "prior_avg", "recent_avg", "change", "pct_change",
-                                  "slope_per_period"], out))
-    result["recent_periods"] = sorted(recent)
-    return json.dumps(result)
-
-
-def tools_for(registry):
-    """Tools for the configured databases. The two ERP helpers are written for this dataset's ERP schema, so they're
-    offered only when an `erp` database is configured."""
-    tools = [query_tool(name, cfg.get("description", "")) for name, cfg in registry["databases"].items()]
-    tools += [describe_tables, analyze_trends]
-    if "erp" in registry["databases"]:
-        tools += [find_customers_by_criteria, find_invoices]
-    return tools
