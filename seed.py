@@ -557,7 +557,7 @@ def main():
     crm.commit()
 
     # --- self-check: golden reference queries must return exactly the planted sets
-    from eval import reference_answers
+    from evaluation.golden import reference_answers
     planted = {p: {s["id"] for s in specs if s["profile"] == p} for p, _ in PROFILES}
     expected = {"G01": planted["headline"], "G02": planted["enterprise"], "G03": planted["grower"],
                 "G04": {v["id"] for v in improving}, "G05": planted["unpaid3"], "G06": planted["dormant_big"]}
