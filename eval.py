@@ -114,7 +114,11 @@ def main():
                  f"(uv run seed.py) or, if the change is intended, uv run eval.py --freeze")
 
     # imported here so seed.py can use reference_answers() without an API key
-    from agent import MODEL, TRACING, as_of, ask, current_graph, pydantic_model
+    from cli.app import ask
+    from config.settings import MODEL, TRACING
+    from database.registry import as_of
+    from engine.graph import current_graph
+    from engine.planner import pydantic_model
     from langchain_core.messages import AIMessage, ToolMessage
     from pydantic_ai import Agent
 

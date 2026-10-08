@@ -15,18 +15,6 @@ from langchain_core.tools import StructuredTool, tool
 
 from database.executor import run_sql, table_names
 from database.references import KEEP_ROWS, MAX_ROWS, check_not_retyped, expand_refs, remember, to_json
-from database.registry import load_registry
-
-
-def database_overview():
-    """A few lines per configured database for the prompt: tool, description and tables (no columns). Tables get the
-    optional one-line descriptions from databases.toml, for ones whose purpose isn't obvious from the name."""
-    lines = []
-    for name, cfg in load_registry()["databases"].items():
-        notes = cfg.get("tables", {})
-        tables = ", ".join(f"{t} ({notes[t]})" if t in notes else t for t in table_names(name))
-        lines.append(f"- {name} (tool query_{name}): {cfg.get('description', '')}. Tables: {tables}")
-    return "\n".join(lines)
 
 
 def query_tool(name, description):
