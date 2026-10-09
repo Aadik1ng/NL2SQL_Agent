@@ -12,7 +12,13 @@ docker compose up -d          # once: LiteLLM gateway + Langfuse. Docker restart
 uv run seed.py                # builds data/erp.db + data/crm.db (deterministic, as of 2026-10-08)
 uv run agent.py               # interactive; or: uv run agent.py "your question"
 uv run eval.py                # runs the 20-question golden dataset and scores it (--judge adds a faithfulness check)
+uv run visualize.py           # writes graph.png from the current compiled LangGraph
 ```
+
+The graph visualization is generated from the compiled workflow, so adding or removing nodes or edges in
+`engine/graph.py` automatically changes the diagram. Use `uv run visualize.py --format ascii` to print it in the
+terminal, or `uv run visualize.py --format mermaid --output graph.mmd` to save Mermaid source. PNG rendering uses
+LangGraph's built-in Mermaid renderer and requires internet access.
 
 Stack: **LangGraph** runs the agent loop, **Pydantic AI** produces the typed outputs (the plan,
 and the eval judge's verdicts), **LiteLLM** is the gateway every model call goes through, and
@@ -378,7 +384,7 @@ days late to on time (plus 3 that got worse).
 ## Files
 
 ```
-agent.py · eval.py · seed.py   entry points (uv run ...)
+agent.py · eval.py · seed.py · visualize.py   entry points (uv run ...)
 docker-compose.yml             LiteLLM gateway + Langfuse in one stack
 
 config/      settings.py: .env, model endpoint, tracing switch · databases.toml: the database registry

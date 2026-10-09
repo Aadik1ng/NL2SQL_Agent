@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Agentic SQL query engine: a LangGraph agent that plans and runs multi-step SQL over separate ERP and CRM databases"
 requires-python = ">=3.12"
 dependencies = [
+    "grandalf>=0.8",
     "langchain>=1.4.3",
     "langchain-openai>=1.6.7",
     "langfuse>=4.17.0",
