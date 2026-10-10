@@ -81,12 +81,18 @@ def build_graph(registry_text):
             prompt += OUT_OF_BUDGET
         return {"messages": [model.invoke([cached_system(prompt), *msgs])]}
 
+    # errors go back to the model as messages
+    return wire(plan, agent, ToolNode(tools, handle_tool_errors=True)).compile(checkpointer=SAVER)
+
+
+def wire(plan, agent, tools):
+    """The graph's shape, apart from its nodes, so visualize.py can draw it without a model, API key or databases."""
     graph = StateGraph(State)
     graph.add_node("plan", plan)
     graph.add_node("agent", agent)
-    graph.add_node("tools", ToolNode(tools, handle_tool_errors=True))  # errors go back to the model as messages
+    graph.add_node("tools", tools)
     graph.add_edge(START, "plan")
     graph.add_edge("plan", "agent")
     graph.add_conditional_edges("agent", tools_condition)
     graph.add_edge("tools", "agent")
-    return graph.compile(checkpointer=SAVER)
+    return graph

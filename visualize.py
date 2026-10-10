@@ -7,7 +7,12 @@
 import argparse
 from pathlib import Path
 
-from engine.graph import current_graph
+from engine.graph import wire
+
+
+def node(state):
+    """Stands in for the real nodes: drawing needs only the graph's shape, not a model, API key or databases."""
+    return {}
 
 
 def main():
@@ -16,7 +21,7 @@ def main():
     parser.add_argument("--output", type=Path, help="Output file (defaults to graph.png for PNG)")
     args = parser.parse_args()
 
-    graph = current_graph().get_graph()
+    graph = wire(node, node, node).compile().get_graph()
     if args.format == "ascii":
         print(graph.draw_ascii())
     elif args.format == "mermaid":
