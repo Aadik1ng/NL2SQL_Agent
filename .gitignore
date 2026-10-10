@@ -2,3 +2,5 @@ data/
 .env
 __pycache__/
 .venv/
+graph.png
+graph.mmd
