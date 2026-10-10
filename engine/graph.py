@@ -1,6 +1,8 @@
 """The reasoning loop as a LangGraph graph: plan -> agent <-> tools. Rebuilt only when the database registry changes."""
 import sys
-from functools import cache
+import tomllib
+from datetime import date
+from functools import lru_cache
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -10,7 +12,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from pydantic_ai import Agent
 
 from config.settings import LLM_API_KEY, LLM_BASE_URL, MODEL, TRACING, reachable
-from database.registry import REGISTRY, as_of, load_registry
+from database.registry import REGISTRY
 from engine.planner import build_planner
 from engine.prompts import AGENT_INSTRUCTIONS, OUT_OF_BUDGET, PLAN_INSTRUCTIONS, SYSTEM, database_overview
 from tools import tools_for
@@ -33,12 +35,13 @@ SAVER = InMemorySaver()  # shared across rebuilds, so a conversation survives a 
 
 
 def current_graph():
-    """The graph for the databases configured right now; rebuilt only when databases.toml changes."""
-    return build_graph(REGISTRY.read_text())
+    """The graph for the databases configured right now; rebuilt when databases.toml changes or, unless the registry
+    pins as_of, when the date does."""
+    return build_graph(REGISTRY.read_text(), date.today().isoformat())
 
 
-@cache
-def build_graph(registry_text):
+@lru_cache(maxsize=1)  # only the current registry's graph; a superseded one is dropped
+def build_graph(registry_text, today):
     if not LLM_API_KEY:
         sys.exit("Set LLM_API_KEY (LiteLLM proxy) or OPENROUTER_API_KEY in your environment or in .env")
     if "localhost" in LLM_BASE_URL and not reachable(LLM_BASE_URL + "/health/liveliness"):
@@ -50,10 +53,12 @@ def build_graph(registry_text):
         Agent.instrument_all()
     # max_tokens is generous because reasoning models (GPT-5) count their hidden reasoning against it
     llm = ChatOpenAI(model=MODEL, base_url=LLM_BASE_URL, api_key=LLM_API_KEY, temperature=0, max_tokens=16384)
-    registry = load_registry()
+    registry = tomllib.loads(registry_text)  # the text that keys the cache, not a second read of the file
+    today = registry.get("as_of") or today
     tools = tools_for(registry)
     context = registry.get("context", "").strip()
-    system = SYSTEM.format(context=f"\n{context}\n" if context else "", today=as_of(), databases=database_overview())
+    system = SYSTEM.format(context=f"\n{context}\n" if context else "", today=today,
+                           databases=database_overview(registry))
     planner = build_planner(system + PLAN_INSTRUCTIONS)
     worker = llm.bind_tools(tools)
     closer = llm.bind_tools(tools, tool_choice="none")  # tools stay declared because history contains tool calls
@@ -75,7 +80,7 @@ def build_graph(registry_text):
         msgs = state["messages"]
         last_question = max(i for i, m in enumerate(msgs) if isinstance(m, HumanMessage))
         rounds = sum(1 for m in msgs[last_question:] if isinstance(m, AIMessage) and m.tool_calls)
-        prompt = system + AGENT_INSTRUCTIONS.format(plan=state["plan"], today=as_of())
+        prompt = system + AGENT_INSTRUCTIONS.format(plan=state["plan"], today=today)
         model = worker if rounds < MAX_TOOL_ROUNDS else closer
         if model is closer:
             prompt += OUT_OF_BUDGET

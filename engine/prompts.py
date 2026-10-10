@@ -1,6 +1,5 @@
 """Everything the model is told: role and rules, planner and agent instructions, and the database overview."""
 from database.executor import table_names
-from database.registry import load_registry
 
 SYSTEM = """You are a data analyst agent. You answer business questions by querying the databases below with tools \
 and reasoning over the results.
@@ -70,11 +69,11 @@ if nothing matches or the answer is a single number or name."""
 OUT_OF_BUDGET = "\n\nTool budget used up. Give your best final answer now from the evidence so far and say what is missing."
 
 
-def database_overview():
+def database_overview(registry):
     """A few lines per configured database for the prompt: tool, description and tables (no columns). Tables get the
     optional one-line descriptions from databases.toml, for ones whose purpose isn't obvious from the name."""
     lines = []
-    for name, cfg in load_registry()["databases"].items():
+    for name, cfg in registry["databases"].items():
         notes = cfg.get("tables", {})
         tables = ", ".join(f"{t} ({notes[t]})" if t in notes else t for t in table_names(name))
         lines.append(f"- {name} (tool query_{name}): {cfg.get('description', '')}. Tables: {tables}")
